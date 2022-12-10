@@ -1,7 +1,223 @@
 ---
-title: Hello Universe
-description: "Junaid's Hello Universe"
-date: Sep 6 2022
+title: Deploying Karpenter in AWS using Terraform and Helm
+description: "This tutorial walks you through on how to install Karpenter in AWS. The AWS IAM permissions will be handled using Terraform while the Karpenter app itself will be deployed using Helm"
+date: Dec 15 2022
 ---
 
-## Hello Universe ! 
+# Karpenter !
+
+[Karpenter](https://karpenter.sh/) is an opensource tool that allows you to auto-scale your kubernetes cluster. Initially I was using cluster-autoscaler to provision nodes on demand but I encountered the following pain points with it
+
+1. Cluster autoscaler relies on underlying node groups. I need to create a node group, associate the relevant IAM policies to it, dimension it accordingly. I manage an EKS cluster for multiple customers, each having their own node group. Everytime I onboard a new clustomer or offboard an old one, i need to update my Terraform code.
+2. Everytime a customer requirements are updated, I need to update certain configurations in the terrafrom code i.e update instance type or tags
+3. If a nodegroup is being updated, certain issues were found while spawning up new nodes.
+
+Karpenter takes away all of these issues.
+
+1. No need to create nodegroup. You only need to have one nodegroup which acts as your core node group with a minimum of 2 nodes for HA. This nodegroup hosts all system crititcal pods like CNI, kube-proxy and ofcourse Karpenter pods.
+2. No need to do homework on how to dimension the nodes. Based on the workload requirment, Karpenter will find the appropriate instance type and launch it to host your workload.
+3. If Karpenter finds a cheaper node to host you workload, it will switch your workload there hence reducing costs
+
+## Deployment
+
+Lets get to deploying Karpenter. My use case is simple. I have an EKS cluster on which I want to run resources for 2 customers. Each customer has their own setup of resource requirments, each set of IAM policies to work with. I'll call them customer Alpha and customer Beta.
+
+For the sake of this tutorial, here are some of the values used
+
+
+| Option | Description                                                               |
+| ------ | ------------------------------------------------------------------------- |
+| EKS cluster name  | acme |
+| AWS account ID | `1234567890`    |
+| OIDC URL    | `oidc.eks.ca-central-1.amazonaws.com/id/C99F50C4A2A9B6C3516F9BB73F3237D7`                                     |
+| Default InstanceProfle | `default-acme`|
+
+
+
+### EKS configurations
+
+Certain configs needs to be done on the EKS cluster. If you are using the EKS module, the following configs need to part of your Terraform module
+
+#### Security Group
+
+The below config will create a Security Group rule to allow traffic so that Karpenter can talk to the cluster API
+```json
+  node_security_group_additional_rules = {
+    ingress_nodes_karpenter_port = {
+      description                   = "Cluster API to Node group for Karpenter webhook"
+      protocol                      = "tcp"
+      from_port                     = 8443
+      to_port                       = 8443
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
+  }
+```
+
+The below config adds a tag to the security group. This is how Karpenter will discover the security group
+
+```json
+node_security_group_tags = {
+    "karpenter.sh/discovery" = "acme"
+  }
+```
+
+We will be leveraging [IAM roles for service accounts](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html) so that the kubernetes service account deployed in an EKS cluster can assume the permissions of an AWS IAM role.
+
+### IAM 
+```
+module "karpenter_irsa" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "5.3.1"
+  providers = {
+    aws = aws.dts-dev
+  }
+
+  role_name                          = "karpenter-controller-acme"
+  attach_karpenter_controller_policy = true
+
+  karpenter_tag_key               = "karpenter.sh/discovery/acme"
+  karpenter_controller_cluster_id = module.eks.cluster_id
+  karpenter_controller_node_iam_role_arns = [
+    module.eks.eks_managed_node_groups["core"].iam_role_arn
+  ]
+
+  oidc_providers = {
+    ex = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["karpenter:karpenter"]
+    }
+  }
+}
+
+```
+
+The above module does the following:
+
+1. Create an IAM role for Karpenter
+2. Associate permissions to the IAM role
+
+```json
+{
+    "Statement": [
+        {
+            "Action": [
+                "pricing:GetProducts",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeSpotPriceHistory",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeLaunchTemplates",
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceTypes",
+                "ec2:DescribeInstanceTypeOfferings",
+                "ec2:DescribeImages",
+                "ec2:DescribeAvailabilityZones",
+                "ec2:CreateTags",
+                "ec2:CreateLaunchTemplate",
+                "ec2:CreateFleet"
+            ],
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": ""
+        },
+        {
+            "Action": [
+                "ec2:TerminateInstances",
+                "ec2:DeleteLaunchTemplate"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "ec2:ResourceTag/karpenter.sh/discovery/acme": "acme"
+                }
+            },
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": ""
+        },
+        {
+            "Action": "ec2:RunInstances",
+            "Condition": {
+                "StringEquals": {
+                    "ec2:ResourceTag/karpenter.sh/discovery/acme": "acme"
+                }
+            },
+            "Effect": "Allow",
+            "Resource": [
+                "arn:aws:ec2:*:1234567890:security-group/*",
+                "arn:aws:ec2:*:1234567890:launch-template/*"
+            ],
+            "Sid": ""
+        },
+        {
+            "Action": "ec2:RunInstances",
+            "Effect": "Allow",
+            "Resource": [
+                "arn:aws:ec2:*::image/*",
+                "arn:aws:ec2:*:1234567890:volume/*",
+                "arn:aws:ec2:*:1234567890:network-interface/*",
+                "arn:aws:ec2:*:1234567890:instance/*",
+                "arn:aws:ec2:*:1234567890:subnet/*"
+            ],
+            "Sid": ""
+        },
+        {
+            "Action": "ssm:GetParameter",
+            "Effect": "Allow",
+            "Resource": "arn:aws:ssm:*:*:parameter/aws/service/*",
+            "Sid": ""
+        },
+        {
+            "Action": "iam:PassRole",
+            "Effect": "Allow",
+            "Resource": [
+                "arn:aws:iam::1234567890:role/core"
+            ],
+            "Sid": ""
+        }
+    ],
+    "Version": "2012-10-17"
+}
+```
+
+3. Build a Trust Relationship i.e. configure a Kubernetes service account to assume an IAM role.
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "",
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::1234567890:oidc-provider/oidc.eks.ca-central-1.amazonaws.com/id/C99F50C4A2A9B6C3516F9BB73F3237D7"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "oidc.eks.ca-central-1.amazonaws.com/id/C99F50C4A2A9B6C3516F9BB73F3237D7:sub": "system:serviceaccount:karpenter:karpenter",
+                    "oidc.eks.ca-central-1.amazonaws.com/id/C99F50C4A2A9B6C3516F9BB73F3237D7:aud": "sts.amazonaws.com"
+                }
+            }
+        }
+    ]
+}
+```
+
+We also need to create the default InstanceProfile. This is what is specific in the Karpenter config. An InstanceProfile maps to one IAM role. We will map it to the IAM role associated with the `core` node group.
+
+```json
+resource "aws_iam_instance_profile" "default" {
+  name = "default-acme"
+  role = module.eks.eks_managed_node_groups["core"].iam_role_name
+}
+```
+
+where `oidc.eks.ca-central-1.amazonaws.com/id/C99F50C4A2A9B6C3516F9BB73F3237D7` is the OpenID connect URL of the EKS cluster.
+
+By this point we have the following done
+
+1. EKS cluster created with a default `core` nodegroup with 3 nodes
+2. A security group allowing traffic on port `8443` from cluster to the nodegroup
+3. Security group tagged properly
+4. Relevant IAM roles/policies for Karepneter created and trust relationship between IAM role and kubernetes service account crerated.
+5. Default instance profile created
